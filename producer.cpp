@@ -86,10 +86,25 @@ int main(int argc, char *argv[]) {
     if (strlen(argv[1]) > 10) {
         printf(RED "Error: Commodity Name must be at most 10 characters long\n" RESET);
         return 1;
-    } else {
-        strcpy(commodity.name, argv[1]);
     }
-
+    const char *commodities[] = {
+        "ALUMINIUM", "COTTON", "COPPER", "CRUDEOIL",
+        "GOLD", "LEAD", "MENTHAOIL", "NATURALGAS",
+        "NICKEL", "SILVER", "ZINC"
+    };
+    bool validCommodity = false;
+    for (const char *item : commodities) {
+        if (strcmp(argv[1], item) == 0) {
+            validCommodity = true;
+            break;
+        }
+    }
+    if (!validCommodity) {
+        printf(RED "Error: Invalid Commodity Name\n" RESET);
+        return 1;
+    }
+    strcpy(commodity.name, argv[1]);
+    
     double mean = strtod(argv[2], &end);
     if (end == argv[2] || *end != '\0' || !isfinite(mean) || mean < 0) {
         printf(RED "Error: Price Mean must be a valid number greater than or equal to 0\n" RESET);
