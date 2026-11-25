@@ -188,13 +188,13 @@ int main(int argc, char *argv[]) {
     bool emptyCreated = false;
     bool fullCreated = false;
 
-    context.mutex = sem_open("/mutex", O_CREAT | O_EXCL, 0666, 1);
+    context.mutex = sem_open("/mutex", 0);
     mutexCreated = (context.mutex != SEM_FAILED);
 
-    context.empty = sem_open("/empty", O_CREAT | O_EXCL, 0666, context.BufferSize);
+    context.empty = sem_open("/empty", 0);
     emptyCreated = (context.empty != SEM_FAILED);
 
-    context.full = sem_open("/full", O_CREAT | O_EXCL, 0666, 0);
+    context.full = sem_open("/full", 0);
     fullCreated = (context.full != SEM_FAILED);
 
     if (context.mutex == SEM_FAILED || context.empty == SEM_FAILED || context.full == SEM_FAILED) {
