@@ -12,6 +12,7 @@
 #include <semaphore.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdarg.h>
 
 // ANSI escape sequences (\033 --> escape char in C)
 #define RESET "\033[0m"
@@ -55,7 +56,22 @@ void handle_signal(int signal) {
     running = 0;
 }
 void cleanup(ProducerContext &context);
-void write_to_shared_memory( ProducerContext &context , int index , std::normal_distribution<double> &distribution, std::mt19937 &gen);
+void write_to_shared_memory( ProducerContext &context , int index , double price);
+
+// prints a log line: "YYYY/MM/DD HH:MM:SS NAME: message"
+static void log_msg(const char *name, const char *fmt, ...) {
+    time_t now = time(NULL);
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y/%m/%d %H:%M:%S", &tm_info);
+    fprintf(stderr, "%s %s: ", ts, name);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+}
 
 int main(int argc, char *argv[]) {
     Commodity commodity;
@@ -225,12 +241,18 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     while (running) {    
+        double price = (context.commodity.priceStdDev == 0) ? context.commodity.priceMean : distribution(gen); // Generate a random price based on the normal distribution
+        log_msg(context.commodity.name, "generating a new value %.2f", price);
+        log_msg(context.commodity.name, "trying to get mutex on shared buffer");
         sem_wait(context.empty); // Wait for an empty slot in the buffer
         sem_wait(context.mutex); // Lock the buffer for exclusive access
-        write_to_shared_memory(context, header->write_index, distribution, gen);
+        log_msg(context.commodity.name, "placing %.2f on shared buffer", price);
+        write_to_shared_memory(context, header->write_index, price);
         header->write_index = (header->write_index + 1) % context.BufferSize; // Update the write index in a circular manner
         sem_post(context.mutex); // Unlock the buffer
         sem_post(context.full);  // Signal that a new item has been added to the buffer
+        log_msg(context.commodity.name, "sleeping for %d ms", context.commodity.SleepTime);
+        fprintf(stderr, "\n");
         usleep(context.commodity.SleepTime * 1000);
     }
     cleanup(context);
@@ -258,15 +280,10 @@ void cleanup(ProducerContext &context) {
         context.shm_fd = -1;
     }
 }
-void write_to_shared_memory( ProducerContext &context , int index, std::normal_distribution<double> &distribution, std::mt19937 &gen) {
+void write_to_shared_memory( ProducerContext &context , int index, double price) {
     BufferEntry *bufferstart = (BufferEntry *)((char *)context.ptr + sizeof(SharedMemoryHeader)); // Move the pointer to the start of the buffer
     BufferEntry *entry = &bufferstart[index];   // Get the entry at the current write index
     strcpy(entry->commodityName, context.commodity.name);
-    entry->price = (context.commodity.priceStdDev == 0) ? context.commodity.priceMean : distribution(gen); // Generate a random price based on the normal distribution
+    entry->price = price;
     clock_gettime(CLOCK_REALTIME, &entry->timestamp); // Get the current timestamp
-    
-    fprintf(stderr,GREEN "%ld Producer: %s updated to %.2f\n" RESET,
-        entry->timestamp.tv_sec,
-        entry->commodityName,
-        entry->price);    
 }
