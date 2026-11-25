@@ -9,6 +9,9 @@
 #include <math.h>
 #include <time.h>
 #include <random>
+#include <semaphore.h>
+#include <limits.h>
+#include <signal.h>
 
 // ANSI escape sequences (\033 --> escape char in C)
 #define RESET "\033[0m"
@@ -43,18 +46,18 @@ struct ProducerContext
     void *ptr;
     int BufferSize;
     Commodity commodity;
+    sem_t *mutex = SEM_FAILED;           // ensures mutual exclusion (no 2 processes can access buffer at the same time)
+    sem_t *empty = SEM_FAILED;           // number of empty places in buffer (no producer can write in a full buffer) 
+    sem_t *full = SEM_FAILED;            // number of elements in buffer (no consumer can read from an empty buffer)
 };
-std::random_device rd;
-std::mt19937 gen(rd());
-
-std::normal_distribution<double> distribution(
-    context.commodity.priceMean,
-    context.commodity.priceStdDev
-);
-void write_to_shared_memory(const char *message, ProducerContext &context);
+volatile sig_atomic_t running = 1;
+void handle_signal(int signal) {
+    running = 0;
+}
+void cleanup(ProducerContext &context);
+void write_to_shared_memory( ProducerContext &context , int index , std::normal_distribution<double> &distribution, std::mt19937 &gen);
 
 int main(int argc, char *argv[]) {
-while (true){
     Commodity commodity;
     char *end;
 
@@ -96,11 +99,26 @@ while (true){
     }
 // ******************************* validations of context and error handling *****************************************************
     ProducerContext context;
-    context.commodity = commodity;
-
+    context.commodity = commodity;    
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::normal_distribution<double> distribution(
+        context.commodity.priceMean,
+        context.commodity.priceStdDev
+    );
     long bufferSize = strtol(argv[5], &end, 10);
-    if (end == argv[5] || *end != '\0' || bufferSize <= 0) {
+    if (end == argv[5] || *end != '\0' || bufferSize <= 0 || bufferSize > INT_MAX) {
         printf(RED "Error: Buffer Size must be a valid integer greater than 0\n" RESET);
+        return 1;
+    }
+    sem_t *init_lock = sem_open("/init_lock", O_CREAT, 0666, 1);
+    if (init_lock == SEM_FAILED) {
+        perror("init_lock sem_open failed");
+        return 1;
+    }
+    if (sem_wait(init_lock) == -1) {
+        perror("sem_wait init_lock failed");
+        sem_close(init_lock);
         return 1;
     }
     context.BufferSize = (int)bufferSize;
@@ -112,26 +130,43 @@ while (true){
             context.shm_fd = shm_open(context.name, O_RDWR, 0666);  // try to open the existing one with read/write permissions
             if (context.shm_fd == -1) {
                 perror("shm_open existing object failed");
+                sem_post(init_lock);
+                sem_close(init_lock);
                 return 1;
             }
         } else {   // if it fails for any other reason
             perror("shm_open failed");
+            sem_post(init_lock);
+            sem_close(init_lock);
             return 1;
         }
     } else {
         created = true;
         printf(GREEN "Shared memory object created successfully.\n" RESET);     
     }
-    context.shm_Size = sizeof(SharedMemoryHeader) + context.BufferSize * sizeof(BufferEntry);
-    if (created) {
-        if (ftruncate(context.shm_fd, context.shm_Size  ) == -1) {
-            perror("ftruncate failed");
-            return 1;
-        }
+    struct stat shmStat;
+    if (fstat(context.shm_fd, &shmStat) == -1) {
+        perror("fstat failed");    // if it fails to get the status of the shared memory object
+        sem_post(init_lock);
+        sem_close(init_lock);
+        return 1;
     }
-    context.ptr = mmap(0, context.shm_Size, PROT_WRITE, MAP_SHARED, context.shm_fd, 0);
+    if (created) {
+    context.shm_Size = sizeof(SharedMemoryHeader) + context.BufferSize * sizeof(BufferEntry);
+    if (ftruncate(context.shm_fd, context.shm_Size) == -1) {
+        perror("ftruncate failed");
+        sem_post(init_lock);
+        sem_close(init_lock);
+        return 1;
+    }
+    } else {
+        context.shm_Size = shmStat.st_size;
+    }
+    context.ptr = mmap(0, context.shm_Size, PROT_READ | PROT_WRITE, MAP_SHARED, context.shm_fd, 0);
     if (context.ptr == MAP_FAILED) {
         perror("mmap failed");
+        sem_post(init_lock);
+        sem_close(init_lock);
         return 1;
     }
     SharedMemoryHeader *header = (SharedMemoryHeader *)context.ptr;
@@ -139,25 +174,99 @@ while (true){
         header->write_index = 0;
         header->read_index = 0;
         header->BufferSize = context.BufferSize;
+        context.mutex = sem_open("/mutex", O_CREAT | O_EXCL , 0666, 1);
+        context.empty = sem_open("/empty", O_CREAT | O_EXCL , 0666, context.BufferSize);
+        context.full  = sem_open("/full", O_CREAT | O_EXCL , 0666, 0);
+    } else {
+    if (context.shm_Size != sizeof(SharedMemoryHeader) + context.BufferSize * sizeof(BufferEntry) || header->BufferSize != context.BufferSize) {
+        printf(RED "Error: Buffer size mismatch\n" RESET);
+        sem_post(init_lock);
+        sem_close(init_lock);
+        return 1;
     }
-    else {
-        if (header->BufferSize != context.BufferSize) {
-            printf("Error: Buffer size mismatch\n");
-            return 1;
-        }
+    bool mutexCreated = false;
+    bool emptyCreated = false;
+    bool fullCreated = false;
+
+    context.mutex = sem_open("/mutex", O_CREAT | O_EXCL, 0666, 1);
+    mutexCreated = (context.mutex != SEM_FAILED);
+
+    context.empty = sem_open("/empty", O_CREAT | O_EXCL, 0666, context.BufferSize);
+    emptyCreated = (context.empty != SEM_FAILED);
+
+    context.full = sem_open("/full", O_CREAT | O_EXCL, 0666, 0);
+    fullCreated = (context.full != SEM_FAILED);
+
+    if (context.mutex == SEM_FAILED || context.empty == SEM_FAILED || context.full == SEM_FAILED) {
+        perror("sem_open failed");
+        cleanup(context);
+        if (mutexCreated)
+            sem_unlink("/mutex");
+        if (emptyCreated)
+            sem_unlink("/empty");
+        if (fullCreated)
+            sem_unlink("/full");
+        if (created)
+            shm_unlink(context.name);
+        sem_post(init_lock);
+        sem_close(init_lock);
+        return 1;
     }
-    BufferEntry *bufferstart = (BufferEntry *)((char *)context.ptr + sizeof(SharedMemoryHeader));
-    write_to_shared_memory(context, header->write_index);
-    usleep(context.commodity.SleepTime * 1000);
+    }
+    if (context.mutex == SEM_FAILED || context.empty == SEM_FAILED || context.full == SEM_FAILED) {
+        perror("sem_open failed");
+        sem_post(init_lock);
+        sem_close(init_lock);
+        return 1;
+    }
+    sem_post(init_lock);
+    sem_close(init_lock);
+    // ******************************** Producer loop to write to shared memory *****************************************************
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+    while (running) {    
+        sem_wait(context.empty); // Wait for an empty slot in the buffer
+        sem_wait(context.mutex); // Lock the buffer for exclusive access
+        write_to_shared_memory(context, header->write_index, distribution, gen);
+        header->write_index = (header->write_index + 1) % context.BufferSize; // Update the write index in a circular manner
+        sem_post(context.mutex); // Unlock the buffer
+        sem_post(context.full);  // Signal that a new item has been added to the buffer
+        usleep(context.commodity.SleepTime * 1000);
+    }
+    cleanup(context);
     return 0;
 }
+void cleanup(ProducerContext &context) {
+    if (context.mutex != SEM_FAILED) {
+        sem_close(context.mutex);
+        context.mutex = SEM_FAILED;
+    }
+    if (context.empty != SEM_FAILED) {
+        sem_close(context.empty);
+        context.empty = SEM_FAILED;
+    }
+    if (context.full != SEM_FAILED) {
+        sem_close(context.full);
+        context.full = SEM_FAILED;
+    }
+    if (context.ptr != MAP_FAILED) {
+        munmap(context.ptr, context.shm_Size);
+        context.ptr = MAP_FAILED;
+    }
+    if (context.shm_fd != -1) {
+        close(context.shm_fd);
+        context.shm_fd = -1;
+    }
 }
-
-void write_to_shared_memory( ProducerContext &context , int index) {
+void write_to_shared_memory( ProducerContext &context , int index, std::normal_distribution<double> &distribution, std::mt19937 &gen) {
     BufferEntry *bufferstart = (BufferEntry *)((char *)context.ptr + sizeof(SharedMemoryHeader)); // Move the pointer to the start of the buffer
     BufferEntry *entry = &bufferstart[index];   // Get the entry at the current write index
     strcpy(entry->commodityName, context.commodity.name);
-    entry->price = distribution(gen); // Generate a random price based on the normal distribution
+    entry->price = (context.commodity.priceStdDev == 0) ? context.commodity.priceMean : distribution(gen); // Generate a random price based on the normal distribution
     clock_gettime(CLOCK_REALTIME, &entry->timestamp); // Get the current timestamp
-    fprintf(stderr,GREEN "%ld Producer: %s updated to %.2f\n" RESET,entry->timestamp.tv_sec,entry->commodityName,entry->price);    
+    
+    fprintf(stderr,GREEN "%ld Producer: %s updated to %.2f\n" RESET,
+        entry->timestamp.tv_sec,
+        entry->commodityName,
+        entry->price);    
 }
