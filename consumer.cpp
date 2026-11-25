@@ -176,7 +176,20 @@ int main(int argc, char *argv[]){
         (BufferEntry *)((char *)context.ptr + sizeof(SharedMemoryHeader));
     while (running)
     {
-        sem_wait(context.full);
+        while (sem_trywait(context.full) == -1) {
+            if (errno != EAGAIN && errno != EINTR) {
+                perror("sem_trywait failed");
+                running = 0;
+                break;
+            }
+            if (!running) {
+                break;
+            }
+            usleep(10000);
+        }
+        if (!running) {
+            break;
+        }
         sem_wait(context.mutex);
         BufferEntry entry = bufferstart[header->read_index];
         header->read_index = (header->read_index + 1) % context.BufferSize;
