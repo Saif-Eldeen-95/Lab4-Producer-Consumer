@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <math.h>
+#include <time.h>
+#include <random>
 
 // ANSI escape sequences (\033 --> escape char in C)
 #define RESET "\033[0m"
@@ -16,6 +18,16 @@
 #define BLUE "\033[0;94m"
 #define CLEAR "\033[2J \033[1;1H"
 
+struct BufferEntry {
+    char commodityName[11];
+    double price;
+    struct timespec timestamp;
+};
+struct SharedMemoryHeader {
+    int write_index;
+    int read_index;
+    int BufferSize;
+};
 struct Commodity
 {
     char name[11];
@@ -23,20 +35,26 @@ struct Commodity
     double priceStdDev;
     int SleepTime;
 };
-
 struct ProducerContext
 {
     const char *name = "/SH_Mem";
-    const int SIZE = 1000;
+    size_t shm_Size;
     int shm_fd;
     void *ptr;
     int BufferSize;
     Commodity commodity;
 };
+std::random_device rd;
+std::mt19937 gen(rd());
 
+std::normal_distribution<double> distribution(
+    context.commodity.priceMean,
+    context.commodity.priceStdDev
+);
 void write_to_shared_memory(const char *message, ProducerContext &context);
 
 int main(int argc, char *argv[]) {
+while (true){
     Commodity commodity;
     char *end;
 
@@ -102,24 +120,44 @@ int main(int argc, char *argv[]) {
         }
     } else {
         created = true;
-        printf(GREEN "Shared memory object created successfully.\n" RESET);
+        printf(GREEN "Shared memory object created successfully.\n" RESET);     
     }
+    context.shm_Size = sizeof(SharedMemoryHeader) + context.BufferSize * sizeof(BufferEntry);
     if (created) {
-        if (ftruncate(context.shm_fd, context.SIZE) == -1) {
+        if (ftruncate(context.shm_fd, context.shm_Size  ) == -1) {
             perror("ftruncate failed");
             return 1;
         }
     }
-    context.ptr = mmap(0, context.SIZE, PROT_WRITE, MAP_SHARED, context.shm_fd, 0);
+    context.ptr = mmap(0, context.shm_Size, PROT_WRITE, MAP_SHARED, context.shm_fd, 0);
     if (context.ptr == MAP_FAILED) {
         perror("mmap failed");
         return 1;
     }
-    write_to_shared_memory("Hello from Producer!", context);
+    SharedMemoryHeader *header = (SharedMemoryHeader *)context.ptr;
+    if (created) {
+        header->write_index = 0;
+        header->read_index = 0;
+        header->BufferSize = context.BufferSize;
+    }
+    else {
+        if (header->BufferSize != context.BufferSize) {
+            printf("Error: Buffer size mismatch\n");
+            return 1;
+        }
+    }
+    BufferEntry *bufferstart = (BufferEntry *)((char *)context.ptr + sizeof(SharedMemoryHeader));
+    write_to_shared_memory(context, header->write_index);
+    usleep(context.commodity.SleepTime * 1000);
     return 0;
 }
+}
 
-void write_to_shared_memory(const char *message, ProducerContext &context) {
-    sprintf((char *)context.ptr, "%s", message);
-    printf(GREEN "Producer: Wrote to shared memory: %s\n" RESET, (char *)context.ptr);
+void write_to_shared_memory( ProducerContext &context , int index) {
+    BufferEntry *bufferstart = (BufferEntry *)((char *)context.ptr + sizeof(SharedMemoryHeader)); // Move the pointer to the start of the buffer
+    BufferEntry *entry = &bufferstart[index];   // Get the entry at the current write index
+    strcpy(entry->commodityName, context.commodity.name);
+    entry->price = distribution(gen); // Generate a random price based on the normal distribution
+    clock_gettime(CLOCK_REALTIME, &entry->timestamp); // Get the current timestamp
+    fprintf(stderr,GREEN "%ld Producer: %s updated to %.2f\n" RESET,entry->timestamp.tv_sec,entry->commodityName,entry->price);    
 }
